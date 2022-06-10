@@ -1,0 +1,157 @@
+version: '3'
+
+networks:
+  traefik-network:
+    driver: bridge
+    external: true
+  growi-network:
+    driver: bridge
+    external: true
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    command: ["yarn migrate && node -r dotenv-flow/config --expose_gc dist/server/app.js"]
+    depends_on:
+      - mongo
+      - elasticsearch
+    entrypoint: "dockerize
+                  -wait tcp://mongo:27017
+                  -wait tcp://elasticsearch:9200
+                  -timeout 60s
+                  /docker-entrypoint.sh"
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/growi
+      - ELASTICSEARCH_URI=http://elasticsearch:9200/growi
+      - PASSWORD_SEED=${GROWI_PASSWORD_SEED}
+      # - FILE_UPLOAD=mongodb   # activate this line if you use MongoDB GridFS rather than AWS
+      # - FILE_UPLOAD=local     # activate this line if you use local storage of server rather than AWS
+      # - MATHJAX=1             # activate this line if you want to use MathJax
+      # - PLANTUML_URI=http://  # activate this line and specify if you use your own PlantUML server rather than public plantuml.com
+      - HACKMD_URI=https://${HACKMD_HOST}    # activate this line and specify HackMD server URI which can be accessed from GROWI client browsers
+      - HACKMD_URI_FOR_SERVER=http://hackmd:3000  # activate this line and specify HackMD server URI which can be accessed from this server container
+      # - FORCE_WIKI_MODE='public'    # activate this line to force wiki public mode
+      # - FORCE_WIKI_MODE='private'   # activate this line to force wiki private mode
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-network"
+      - "traefik.http.services.growi.loadbalancer.server.port=3000"
+      - "traefik.http.routers.growi.rule=Host(`${GROWI_HOST}`)"
+      - "traefik.http.routers.growi.entrypoints=web"
+      
+      #- "traefik.http.routers.growi-secure.rule=Host(`${GROWI_HOST}`)"
+      #- "traefik.http.routers.growi-secure.entrypoints=web-secure"
+      #- "traefik.http.routers.growi-secure.tls=true"
+      #- "traefik.http.routers.growi-secure.tls.certresolver=letsencrypt"
+      #- "traefik.http.routers.growi-secure.service=growi"
+      #- "traefik.http.middlewares.growiheader.headers.customrequestheaders.X-Forwarded-Proto=https"
+      #- "traefik.http.middlewares.growiheader.headers.customrequestheaders.X-Forwarded-Port=443"
+      #- "traefik.http.routers.growi.middlewares=http-to-https" 
+
+    links:
+      - mongo:mongo
+      - elasticsearch:elasticsearch
+    networks:
+      - traefik-network
+      - growi-network
+    ports:
+      - 3000:3000
+      #- 127.0.0.1:3000:3000    # localhost only by default
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ./pv/growi_data
+        target: /data
+
+  mongo:
+    image: mongo:4.4
+    networks:
+      - growi-network
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ./pv/mongo_configdb
+        target: /data/configdb
+      - type: bind
+        source: ./pv/mongo_db
+        target: /data/db
+
+  elasticsearch:
+    build:
+      context: ./elasticsearch
+      dockerfile: ./Dockerfile
+    environment:
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms256m -Xmx256m"  # increase amount if you have enough memory
+      - LOG4J_FORMAT_MSG_NO_LOOKUPS=true # CVE-2021-44228 mitigation for Elasticsearch <= 6.8.20/7.16.0
+    networks:
+      - growi-network
+    restart: unless-stopped
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - type: bind
+        source: ./pv/es_data
+        target: /usr/share/elasticsearch/data
+      - type: bind
+        source: ./elasticsearch/config/elasticsearch.yml
+        target: /usr/share/elasticsearch/config/elasticsearch.yml
+
+  ##
+  # HackMD(CodiMD) container
+  # see https://github.com/hackmdio/codimd#configuration
+  #
+  hackmd:
+    build:
+      context: ./hackmd
+    environment:
+      - GROWI_URI=https://${GROWI_HOST}
+      - CMD_DB_URL=mysql://hackmd:hackmdpass@mariadb:3306/hackmd
+      - CMD_CSP_ENABLE=false
+    depends_on:
+      - mariadb
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-network"
+      - "traefik.http.services.hackmd.loadbalancer.server.port=3000"
+      - "traefik.http.routers.hackmd.rule=Host(`${HACKMD_HOST}`)"
+      - "traefik.http.routers.hackmd.entrypoints=web"
+      
+      #- "traefik.http.routers.hackmd-secure.rule=Host(`${HACKMD_HOST}`)"
+      #- "traefik.http.routers.hackmd-secure.entrypoints=web-secure"
+      #- "traefik.http.routers.hackmd-secure.tls=true"
+      #- "traefik.http.routers.hackmd-secure.tls.certresolver=letsencrypt"
+      #- "traefik.http.routers.hackmd-secure.service=growi2"
+      #- "traefik.http.middlewares.hackmdheader.headers.customrequestheaders.X-Forwarded-Proto=https"
+      #- "traefik.http.middlewares.hackmdheader.headers.customrequestheaders.X-Forwarded-Port=443"
+      #- "traefik.http.routers.hackmd.middlewares=http-to-https" 
+    networks:
+      - growi-network
+      - traefik-network
+    ports:
+      - 3100:3000   # localhost only by default
+    restart: unless-stopped
+
+  ##
+  # MariaDB
+  # see https://hub.docker.com/_/mariadb/
+  mariadb:
+    command: mysqld --character-set-server=utf8 --collation-server=utf8_general_ci
+    environment:
+      - MYSQL_USER=hackmd
+      - MYSQL_PASSWORD=${HACKMD_MARIADB_PASS}
+      - MYSQL_DATABASE=hackmd
+      - MYSQL_RANDOM_ROOT_PASSWORD=true
+    image: mariadb:10.3
+    networks:
+      - growi-network
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ./pv/mariadb_data
+        target: /var/lib/mysql
+
